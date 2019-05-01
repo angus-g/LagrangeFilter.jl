@@ -114,11 +114,57 @@ function filter(fname_u, fname_v)
     close(ds_u)
     close(ds_v)
 end
-    
-# using Plots
-# pyplot(leg=false)
 
-# if length(ARGS) < 2
-#     println("Usage: julia lfilt.jl <U_file> <V_file>")
-#     exit(1)
-# end
+function interp_paths(particles, fname_data, var)
+    ds = Dataset(fname_data, "r")
+    grid = RectangleGrid(ds["X"], ds["Y"])
+    
+    nt = size(particles, 1)
+    out_interp = Array{Float64}(undef, nt, size(particles, 2))
+
+    for t = 1:nt
+        data_slice = ds[var][:,:,t,1]
+
+        out_interp[t,:] = mapslices(p -> interpolate(grid, data_slice, p),
+                                    particles[t,:,:], dims=2)
+    end
+
+    close(ds)
+    out_interp
+end
+
+function filter_paths(paths, dt, min_freq, butterworth)
+    nt = size(paths, 1)
+
+    # construct list frequencies for FFT components
+    ω = 2π/dt * range(0, 1, length=nt)
+
+    # butterworth highpass filter
+    mask = similar(ω)
+    @. mask = 1 - 1/sqrt(1 + (ω/min_freq)^(2*butterworth))
+    # trim to real coefficients only
+    mask = mask[1:floor(Int64, nt/2+1)]
+
+    # perform actual filtering
+    irfft(rfft(paths, 1) .* mask, nt, 1)
+end
+
+function reinterp_grid(positions, data, x, y)
+    kdt = KDTree(positions)
+    out = Array{Float64}(undef, length(x), length(y))
+
+    points = [repeat(x, inner=size(y, 1))
+              repeat(y, outer=size(x, 1))]
+
+    idxs, dists = knn(kdt, points, 6)
+
+    # convert distances to weights
+    weights = map(d -> 1 ./ d, dists)
+    weights ./ map(sum, weights)
+
+    for i in eachindex(out)
+        out[i] = dot(data[idxs[i]], weights[i])
+    end
+
+    out
+end
