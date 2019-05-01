@@ -1,19 +1,7 @@
-using GridInterpolations, NCDatasets
+using FFTW, Interpolations, LinearAlgebra, NCDatasets, NearestNeighbors
 import Distributions.Uniform
 
-## extend grid interpolation to work on array views
-import GridInterpolations.interpolate
-using LinearAlgebra
-
-function interpolate(grid::AbstractGrid, data, x::AbstractVector)
-    index, weight = interpolants(grid, x)
-    dot(data[index], weight)
-end
-# also fix matrices (re-mapping everything to Float64 is very very slow...)
-function interpolate(grid::AbstractGrid, data::Matrix, x::AbstractVector)
-    index, weight = interpolants(grid, x)
-    dot(data[index], weight)
-end
+using ProgressMeter
 
 function filter(fname_u, fname_v)
     ds_u = Dataset(fname_u, "r")
@@ -25,26 +13,22 @@ function filter(fname_u, fname_v)
         exit(1)
     end
 
+    # load coordinates and velocity variables without performing CF conversion
+    x = nomissing(ds_u["X"][:]); y = nomissing(ds_u["Y"][:])
+    var_u = variable(ds_u, "U"); var_v = variable(ds_v, "V")
+
     # get velocity timestep
     dt = ds_u["T"][2] - ds_u["T"][1]
 
     ## generate random initial seeds
-    num_seeds = Int(length(ds_u["X"]) * length(ds_u["Y"]) / 16)
+    num_seeds = Int(length(x) * length(x) / 16)
 
-    num_seeds = 1000
-    x_dist = Uniform(ds_u["X"][1], ds_u["X"][end])
-    y_dist = Uniform(ds_u["Y"][1], ds_u["Y"][end])
+    x_dist = Uniform(x[1], x[end])
+    y_dist = Uniform(y[1], y[end])
 
-    seeds = hcat(rand(x_dist, num_seeds),
-                 rand(y_dist, num_seeds))
-
-    ## save gif of seed positions
-    # anim = @animate for i = 1:16
-    #     scatter(seed_x[i:16:end], seed_y[i:16:end], markersize=2, markerstrokewidth=0,
-    #             xlims = (ds_u["X"][1], ds_u["X"][end]),
-    #             ylims = (ds_u["Y"][1], ds_u["Y"][end]))
-    # end
-    # gif(anim, "seeds.gif", fps = 5)
+    ## single array for seed positions, transpose so that x/y are adjacent
+    seeds = permutedims(hcat(rand(x_dist, num_seeds),
+                             rand(y_dist, num_seeds)))
 
     ## set up output file
     ds_out = Dataset("particles.nc", "c")
@@ -52,41 +36,39 @@ function filter(fname_u, fname_v)
     ds_out.dim["n"] = num_seeds
     ds_out.dim["time"] = Inf
 
-    part_arr = defVar(ds_out, "particles", Float64, ("time", "n", "d"))
+    # output variable (match layout of seeds)
+    part_arr = defVar(ds_out, "particles", Float64, ("d", "n", "time"))
 
-    grid = RectangleGrid(ds_u["X"], ds_u["Y"])
-    left = ds_u["X"][1]
-    width = ds_u["X"][end] - left
+    left = x[1]; width = x[end] - left
 
     # load first velocity fields
-    u_next = ds_u["U"][:,:,1,1]
-    v_next = ds_v["V"][:,:,1,1]
+    u_next = var_u[:,:,1,1]
+    v_next = var_v[:,:,1,1]
+
+    # convenience function to create an interpolator for a velocity field
+    interpolator(u) = interpolate((x, y), u, Gridded(Linear()))
 
     ## advect particles (rk4)
-    anim = @animate for t = 1:length(ds_u["T"])
-        println(t)
-
-        scatter(seeds[:,1], seeds[:,2],
-                markersize=2, markerstrokewidth=0,
-                xlims = (ds_u["X"][1], ds_u["X"][end]),
-                ylims = (ds_u["Y"][1], ds_u["Y"][end]))
-
+    @showprogress 1 "Full advection..." for t = 1:length(ds_u["T"])
         # update velocity
         u = u_next; v = v_next
-        u_next = ds_u["U"][:,:,t,1]; v_next = ds_v["V"][:,:,t,1]
+        u_next = var_u[:,:,t,1]; v_next = var_v[:,:,t,1]
+        # in-between timesteps
         u_inter = (u + u_next) / 2; v_inter = (v + v_next) / 2
 
-        vel_prev = (u, v)
-        vel_inter = (u_inter, v_inter)
-        vel_next = (u_next, v_next)
+        # interpolators
+        vel_prev = (interpolator(u), interpolator(v))
+        vel_inter = (interpolator(u_inter), interpolator(v_inter))
+        vel_next = (interpolator(u_next), interpolator(v_next))
 
-        velocity_at(vels, pos) = [interpolate(grid, vels[1], pos),
-                                  interpolate(grid, vels[2], pos)]
+        velocity_at(vels, pos) = [vels[1](pos...)
+                                  vels[2](pos...)]
+        # interpret a position as periodic in the x direction
         period_x(pos) = [((pos[1] - left) + width) % width + left, pos[2]]
 
         # update particle positions
-        for p in 1:num_seeds
-            pos = seeds[p,:]
+        @time for p in 1:num_seeds
+            pos = seeds[:,p]
             
             # evaluate at (t,x,y)
             vel1 = velocity_at(vel_prev, pos)
@@ -101,16 +83,14 @@ function filter(fname_u, fname_v)
 
             vel4 = velocity_at(vel_next, pos3)
 
-            seeds[p,:] += (vel1 + 2*vel2 + 2*vel3 + vel4) / 6 * dt
-            seeds[p,:] = period_x(seeds[p,:])
+            seeds[:,p] += (vel1 + 2*vel2 + 2*vel3 + vel4) / 6 * dt
+            seeds[:,p] = period_x(seeds[:,p])
         end
 
-        part_arr[t,:,:] = seeds
+        part_arr[:,:,t] = seeds
     end
-    gif(anim, "particles.gif", fps=15)
 
     close(ds_out)
-
     close(ds_u)
     close(ds_v)
 end
