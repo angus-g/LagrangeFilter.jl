@@ -1,6 +1,7 @@
 using FFTW, Interpolations, LinearAlgebra, NCDatasets, NearestNeighbors
 import Distributions.Uniform
 
+using Distributed, SharedArrays
 using ProgressMeter
 
 function filter(fname_u, fname_v)
@@ -27,8 +28,9 @@ function filter(fname_u, fname_v)
     y_dist = Uniform(y[1], y[end])
 
     ## single array for seed positions, transpose so that x/y are adjacent
-    seeds = permutedims(hcat(rand(x_dist, num_seeds),
-                             rand(y_dist, num_seeds)))
+    seeds = SharedArray{Float64}(2, num_seeds)
+    seeds[1,:] = rand(x_dist, num_seeds)
+    seeds[2,:] = rand(y_dist, num_seeds)
 
     ## set up output file
     ds_out = Dataset("particles.nc", "c")
@@ -49,7 +51,7 @@ function filter(fname_u, fname_v)
     interpolator(u) = interpolate((x, y), u, Gridded(Linear()))
 
     ## advect particles (rk4)
-    @showprogress 1 "Full advection..." for t = 1:length(ds_u["T"])
+    @showprogress 1 "Particle advection..." for t = 1:length(ds_u["T"])
         # update velocity
         u = u_next; v = v_next
         u_next = var_u[:,:,t,1]; v_next = var_v[:,:,t,1]
@@ -67,7 +69,7 @@ function filter(fname_u, fname_v)
         period_x(pos) = [((pos[1] - left) + width) % width + left, pos[2]]
 
         # update particle positions
-        @time for p in 1:num_seeds
+        @sync @distributed for p = 1:num_seeds
             pos = seeds[:,p]
             
             # evaluate at (t,x,y)
@@ -97,16 +99,21 @@ end
 
 function interp_paths(particles, fname_data, var)
     ds = Dataset(fname_data, "r")
-    grid = RectangleGrid(ds["X"], ds["Y"])
-    
-    nt = size(particles, 1)
-    out_interp = Array{Float64}(undef, nt, size(particles, 2))
+    data = variable(ds, var)
+    x = ds["X"][:]; y = ds["Y"][:]
 
-    for t = 1:nt
-        data_slice = ds[var][:,:,t,1]
+    _, np, nt = size(particles)
+    #out_interp = Array{Float64}(undef, np, nt)
+    out_interp = SharedArray{Float64}(np, nt)
 
-        out_interp[t,:] = mapslices(p -> interpolate(grid, data_slice, p),
-                                    particles[t,:,:], dims=2)
+    @showprogress 1 "Path interpolation..." for t = 1:nt
+        itp = interpolate((x, y), data[:,:,t,1], Gridded(Linear()))
+
+        part_slice = particles[:,:,t]
+
+        @sync @distributed for p = 1:np
+            out_interp[p,t] = itp(part_slice[:,p]...)
+        end
     end
 
     close(ds)
@@ -114,7 +121,7 @@ function interp_paths(particles, fname_data, var)
 end
 
 function filter_paths(paths, dt, min_freq, butterworth)
-    nt = size(paths, 1)
+    nt = size(paths, 2)
 
     # construct list frequencies for FFT components
     ω = 2π/dt * range(0, 1, length=nt)
@@ -123,27 +130,23 @@ function filter_paths(paths, dt, min_freq, butterworth)
     mask = similar(ω)
     @. mask = 1 - 1/sqrt(1 + (ω/min_freq)^(2*butterworth))
     # trim to real coefficients only
-    mask = mask[1:floor(Int64, nt/2+1)]
+    mask = mask[1:floor(Int, nt/2+1)]
 
-    # perform actual filtering
-    irfft(rfft(paths, 1) .* mask, nt, 1)
+    # perform actual filtering -- along time dimension
+    # need to broadcast out mask
+    irfft(rfft(paths, 2) .* reshape(mask, 1, :), nt, 2)
 end
 
-function reinterp_grid(positions, data, x, y)
+function reinterp_grid(positions, data, points, nx, ny)
     kdt = KDTree(positions)
-    out = Array{Float64}(undef, length(x), length(y))
+    out = SharedArray{Float64}(nx, ny)
 
-    points = [repeat(x, inner=size(y, 1))
-              repeat(y, outer=size(x, 1))]
+    @sync @distributed for i in eachindex(out)
+        idxs, dists = knn(kdt, points[i,:], 6)
+        weights = 1 / dists
+        weights /= sum(weights)
 
-    idxs, dists = knn(kdt, points, 6)
-
-    # convert distances to weights
-    weights = map(d -> 1 ./ d, dists)
-    weights ./ map(sum, weights)
-
-    for i in eachindex(out)
-        out[i] = dot(data[idxs[i]], weights[i])
+        out[i] = dot(data[idxs], weights)
     end
 
     out
