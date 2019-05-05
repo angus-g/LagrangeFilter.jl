@@ -4,7 +4,7 @@ import Distributions.Uniform
 using Distributed, SharedArrays
 using ProgressMeter
 
-function filter(fname_u, fname_v)
+function filter(fname_u, fname_v; np::Int=nothing, nt::Int=nothing, fname_part="particles.nc")
     ds_u = Dataset(fname_u, "r")
     ds_v = Dataset(fname_v, "r")
 
@@ -21,8 +21,16 @@ function filter(fname_u, fname_v)
     # get velocity timestep
     dt = ds_u["T"][2] - ds_u["T"][1]
 
+    if nt == nothing
+        nt = length(ds_u["T"])
+    end
+
     ## generate random initial seeds
-    num_seeds = Int(length(x) * length(x) / 16)
+    if np == nothing
+        num_seeds = Int(length(x) * length(x) / 16)
+    else
+        num_seeds = np
+    end
 
     x_dist = Uniform(x[1], x[end])
     y_dist = Uniform(y[1], y[end])
@@ -33,7 +41,7 @@ function filter(fname_u, fname_v)
     seeds[2,:] = rand(y_dist, num_seeds)
 
     ## set up output file
-    ds_out = Dataset("particles.nc", "c")
+    ds_out = Dataset(fname_part, "c")
     ds_out.dim["d"] = 2
     ds_out.dim["n"] = num_seeds
     ds_out.dim["time"] = Inf
@@ -50,18 +58,27 @@ function filter(fname_u, fname_v)
     # convenience function to create an interpolator for a velocity field
     interpolator(u) = interpolate((x, y), u, Gridded(Linear()))
 
+    time_load = 0.
+    time_interp = 0.
+    time_advect = 0.
+    time_write = 0.
+
     ## advect particles (rk4)
-    @showprogress 1 "Particle advection..." for t = 1:length(ds_u["T"])
+    @showprogress 1 "Particle advection..." for t = 1:nt
         # update velocity
-        u = u_next; v = v_next
-        u_next = var_u[:,:,t,1]; v_next = var_v[:,:,t,1]
-        # in-between timesteps
-        u_inter = (u + u_next) / 2; v_inter = (v + v_next) / 2
+        time_load += @elapsed begin
+            u = u_next; v = v_next
+            u_next = var_u[:,:,t,1]; v_next = var_v[:,:,t,1]
+            # in-between timesteps
+            u_inter = (u + u_next) / 2; v_inter = (v + v_next) / 2
+        end
 
         # interpolators
-        vel_prev = (interpolator(u), interpolator(v))
-        vel_inter = (interpolator(u_inter), interpolator(v_inter))
-        vel_next = (interpolator(u_next), interpolator(v_next))
+        time_interp += @elapsed begin
+            vel_prev = (interpolator(u), interpolator(v))
+            vel_inter = (interpolator(u_inter), interpolator(v_inter))
+            vel_next = (interpolator(u_next), interpolator(v_next))
+        end
 
         velocity_at(vels, pos) = [vels[1](pos...)
                                   vels[2](pos...)]
@@ -69,32 +86,36 @@ function filter(fname_u, fname_v)
         period_x(pos) = [((pos[1] - left) + width) % width + left, pos[2]]
 
         # update particle positions
-        @sync @distributed for p = 1:num_seeds
-            pos = seeds[:,p]
-            
-            # evaluate at (t,x,y)
-            vel1 = velocity_at(vel_prev, pos)
-            pos1 = period_x(pos + 0.5 * vel1 * dt)
+        time_advect += @elapsed begin
+            @sync @distributed for p = 1:num_seeds
+                pos = seeds[:,p]
+                
+                # evaluate at (t,x,y)
+                vel1 = velocity_at(vel_prev, pos)
+                pos1 = period_x(pos + 0.5 * vel1 * dt)
 
-            # evaluate at (t+.5,x',y')
-            vel2 = velocity_at(vel_inter, pos1)
-            pos2 = period_x(pos + 0.5 * vel2 * dt)
+                # evaluate at (t+.5,x',y')
+                vel2 = velocity_at(vel_inter, pos1)
+                pos2 = period_x(pos + 0.5 * vel2 * dt)
 
-            vel3 = velocity_at(vel_inter, pos2)
-            pos3 = period_x(pos + vel3 * dt)
+                vel3 = velocity_at(vel_inter, pos2)
+                pos3 = period_x(pos + vel3 * dt)
 
-            vel4 = velocity_at(vel_next, pos3)
+                vel4 = velocity_at(vel_next, pos3)
 
-            seeds[:,p] += (vel1 + 2*vel2 + 2*vel3 + vel4) / 6 * dt
-            seeds[:,p] = period_x(seeds[:,p])
+                seeds[:,p] += (vel1 + 2*vel2 + 2*vel3 + vel4) / 6 * dt
+                seeds[:,p] = period_x(seeds[:,p])
+            end
         end
 
-        part_arr[:,:,t] = seeds
+        time_write += @elapsed part_arr[:,:,t] = seeds
     end
 
     close(ds_out)
     close(ds_u)
     close(ds_v)
+
+    time_load, time_interp, time_advect, time_write
 end
 
 function interp_paths(particles, fname_data, var)
@@ -106,18 +127,25 @@ function interp_paths(particles, fname_data, var)
     #out_interp = Array{Float64}(undef, np, nt)
     out_interp = SharedArray{Float64}(np, nt)
 
+    time_load = 0.
+    time_interp = 0.
+
     @showprogress 1 "Path interpolation..." for t = 1:nt
-        itp = interpolate((x, y), data[:,:,t,1], Gridded(Linear()))
+        time_load += @elapsed begin
+            itp = interpolate((x, y), data[:,:,t,1], Gridded(Linear()))
+        end
 
         part_slice = particles[:,:,t]
-
-        @sync @distributed for p = 1:np
-            out_interp[p,t] = itp(part_slice[:,p]...)
+        
+        time_interp += @elapsed begin
+            @sync @distributed for p = 1:np
+                out_interp[p,t] = itp(part_slice[:,p]...)
+            end
         end
     end
 
     close(ds)
-    out_interp
+    out_interp, time_load, time_interp
 end
 
 function filter_paths(paths, dt, min_freq, butterworth)
