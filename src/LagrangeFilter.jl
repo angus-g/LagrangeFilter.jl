@@ -4,7 +4,80 @@ import Distributions.Uniform
 using Distributed, SharedArrays
 using ProgressMeter
 
-function filter(fname_u, fname_v; np::Int=nothing, nt::Int=nothing, fname_part="particles.nc")
+"Read a variable from a netCDF file using shared-memory parallelism.
+
+NetCDF offers parallel access of netCDF4 files (through the HDF5) library, but only
+through MPI. However, we don't want to use this paradigm for other parts of the code
+due to the communication overhead. However, the cost of decompressing datasets is
+quite high as it is single-threaded. Ideally, we could read separate chunks using
+different threads to perform this decompression in parallel. But, because HDF5 (and
+by extension, netCDF) locks opened files for single-threaded access, we can't do this.
+
+Instead, this function uses a SharedArray (giving us normal array semantics over a
+shared memory-backed storage) and populates it in parallel, where each thread opens
+its own handle to the specified netCDF file to get around the locking restriction."
+
+function read_var_shmem(fname, var, t)
+    # open the dataset on the main thread to read metadata
+    d = Dataset(fname, "r")
+    meta = d[var]
+
+    # create shared array
+    s = SharedArray{Float64}(size(meta, 1), size(meta, 2))
+
+    # read chunking info and decompose across threads
+    # note we only chunk in the second dimension, since we leverage
+    # the contiguity of the first dimension for better cache access
+    ch = chunking(meta)
+    chunk_size = 1 # assume not chunked
+    if (ch[1] == :chunked)
+        chunk_size = ch[2][2]
+    end
+    n_chunks = size(meta, 2) / chunk_size
+
+    splits = [round(Int, x) for x in range(0, stop=n_chunks, length=length(procs(s))+1)]
+    ranges = [splits[i]*chunk_size + 1:splits[i+1]*chunk_size for i in 1:length(procs(s))]
+
+    @sync @distributed for r in ranges
+        Dataset(fname, "r") do d
+            s[:,r] = d[var][:,r,t,1]
+        end
+    end
+
+    close(d)
+
+    s
+end
+
+"Partial derivative of an array along a dimension.
+
+This computes the fourth-order first derivative of a matrix along the specified dimension. It assumes
+non-periodicity, and shifts the finite differencing stencil at the edges."
+
+function fdiff(var, dx, dim::Integer)
+    d = similar(v)
+
+    # this is a kind of ugly way to do the iteration, but it lets us work on 1D
+    # slices in the simple case
+    for (line, diff) in zip(eachslice(var; dims=3-dim), eachslice(d; dims=3-dim))
+        # left edge
+        diff[1] = [-25, 48, -36, 16, -3] ⋅ line[1:5] / (12 * dx)
+        diff[2] = [-3, -10,  18, -6,  1] ⋅ line[1:5] / (12 * dx)
+
+        # usual centered difference for the interior
+        for i = 3:length(diff)-2
+            diff[i] = [1, -8, 0, 8, -1] ⋅ line[i-2:i+2] / (12 * dx)
+        end
+
+        # right edge (mirrored and negated coefficients)
+        diff[end-1] = [-1, 6, -18, 10, 3] ⋅ line[end-4:end] / (12 * dx)
+        diff[end] = [3, -16, 36, -48, 25] ⋅ line[end-4:end] / (12 * dx)
+    end
+
+    d
+end
+
+function filter(fname_u, fname_v; np::Int=-1, nt::Int=-1, fname_part="particles.nc")
     ds_u = Dataset(fname_u, "r")
     ds_v = Dataset(fname_v, "r")
 
@@ -16,17 +89,16 @@ function filter(fname_u, fname_v; np::Int=nothing, nt::Int=nothing, fname_part="
 
     # load coordinates and velocity variables without performing CF conversion
     x = nomissing(ds_u["X"][:]); y = nomissing(ds_u["Y"][:])
-    var_u = variable(ds_u, "U"); var_v = variable(ds_v, "V")
 
     # get velocity timestep
     dt = ds_u["T"][2] - ds_u["T"][1]
 
-    if nt == nothing
+    if nt == -1
         nt = length(ds_u["T"])
     end
 
     ## generate random initial seeds
-    if np == nothing
+    if np == -1
         num_seeds = Int(length(x) * length(x) / 16)
     else
         num_seeds = np
@@ -51,9 +123,12 @@ function filter(fname_u, fname_v; np::Int=nothing, nt::Int=nothing, fname_part="
 
     left = x[1]; width = x[end] - left
 
+    var_u(t) = read_var_shmem(fname_u, "U", t)
+    var_v(t) = read_var_shmem(fname_v, "V", t)
+
     # load first velocity fields
-    u_next = var_u[:,:,1,1]
-    v_next = var_v[:,:,1,1]
+    u_next = var_u(1)
+    v_next = var_v(1)
 
     # convenience function to create an interpolator for a velocity field
     interpolator(u) = interpolate((x, y), u, Gridded(Linear()))
@@ -68,7 +143,7 @@ function filter(fname_u, fname_v; np::Int=nothing, nt::Int=nothing, fname_part="
         # update velocity
         time_load += @elapsed begin
             u = u_next; v = v_next
-            u_next = var_u[:,:,t,1]; v_next = var_v[:,:,t,1]
+            u_next = var_u(t); v_next = var_v(t)
             # in-between timesteps
             u_inter = (u + u_next) / 2; v_inter = (v + v_next) / 2
         end
@@ -118,13 +193,17 @@ function filter(fname_u, fname_v; np::Int=nothing, nt::Int=nothing, fname_part="
     time_load, time_interp, time_advect, time_write
 end
 
+"Interpolate variable data onto particle paths.
+
+For a timeseries of particle positions (2 × np × nt), interpolate the
+variable with name var from the specified file."
+
 function interp_paths(particles, fname_data, var)
     ds = Dataset(fname_data, "r")
-    data = variable(ds, var)
     x = ds["X"][:]; y = ds["Y"][:]
+    close(ds)
 
     _, np, nt = size(particles)
-    #out_interp = Array{Float64}(undef, np, nt)
     out_interp = SharedArray{Float64}(np, nt)
 
     time_load = 0.
@@ -132,7 +211,8 @@ function interp_paths(particles, fname_data, var)
 
     @showprogress 1 "Path interpolation..." for t = 1:nt
         time_load += @elapsed begin
-            itp = interpolate((x, y), data[:,:,t,1], Gridded(Linear()))
+            data = read_var_shmem(fname_data, var, t)
+            itp = interpolate((x, y), data, Gridded(Linear()))
         end
 
         part_slice = particles[:,:,t]
