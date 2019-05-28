@@ -196,14 +196,11 @@ function advect_particles(fname_u, fname_v; np::Int=-1, nt::Int=-1, fname_part="
         time_load += @elapsed begin
             u = u_next; v = v_next
             u_next = var_u(t); v_next = var_v(t)
-            # in-between timesteps
-            u_inter = (u + u_next) / 2; v_inter = (v + v_next) / 2
         end
 
         # create interpolators onto all velocity fields
         time_interp += @elapsed begin
             vel_prev = (interpolator(u), interpolator(v))
-            vel_inter = (interpolator(u_inter), interpolator(v_inter))
             vel_next = (interpolator(u_next), interpolator(v_next))
         end
 
@@ -213,8 +210,7 @@ function advect_particles(fname_u, fname_v; np::Int=-1, nt::Int=-1, fname_part="
         # update particle positions
         time_advect += @elapsed begin
             @sync @distributed for p = 1:num_seeds
-                seeds[:,p] = advect_rk4(dt, seeds[:,p], wrap,
-                                        vel_prev..., vel_inter..., vel_next...)
+                seeds[:,p] = advect_rk4(dt, seeds[:,p], wrap, vel_prev..., vel_next...)
             end
         end
 
