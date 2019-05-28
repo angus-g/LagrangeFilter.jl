@@ -1,22 +1,30 @@
+module LagrangeFilter
+
 using FFTW, Interpolations, LinearAlgebra, NCDatasets, NearestNeighbors
 import Distributions.Uniform
 
 using Distributed, SharedArrays
 using ProgressMeter
 
-"Read a variable from a netCDF file using shared-memory parallelism.
+"""
+    read_var_shmem(fname, var, t)
 
-NetCDF offers parallel access of netCDF4 files (through the HDF5) library, but only
-through MPI. However, we don't want to use this paradigm for other parts of the code
-due to the communication overhead. However, the cost of decompressing datasets is
-quite high as it is single-threaded. Ideally, we could read separate chunks using
-different threads to perform this decompression in parallel. But, because HDF5 (and
-by extension, netCDF) locks opened files for single-threaded access, we can't do this.
+Read a variable from a netCDF file using shared-memory parallelism.
 
-Instead, this function uses a SharedArray (giving us normal array semantics over a
-shared memory-backed storage) and populates it in parallel, where each thread opens
-its own handle to the specified netCDF file to get around the locking restriction."
+NetCDF offers parallel access of netCDF4 files (through the HDF5)
+library, but only through MPI. However, we don't want to use this
+paradigm for other parts of the code due to the communication
+overhead. However, the cost of decompressing datasets is quite high as
+it is single-threaded. Ideally, we could read separate chunks using
+different threads to perform this decompression in parallel. But,
+because HDF5 (and by extension, netCDF) locks opened files for
+single-threaded access, we can't do this.
 
+Instead,  this function  uses a  SharedArray (giving  us normal  array
+semantics over  a shared  memory-backed storage)  and populates  it in
+parallel,  where each  thread opens  its own  handle to  the specified
+netCDF file to get around the locking restriction.
+"""
 function read_var_shmem(fname, var, t)
     # open the dataset on the main thread to read metadata
     d = Dataset(fname, "r")
@@ -49,11 +57,15 @@ function read_var_shmem(fname, var, t)
     s
 end
 
-"Partial derivative of an array along a dimension.
+"""
+    fdiff(var, dx, dim)
 
-This computes the fourth-order first derivative of a matrix along the specified dimension. It assumes
-non-periodicity, and shifts the finite differencing stencil at the edges."
+Partial derivative of an array along a dimension.
 
+This computes the fourth-order first derivative of a matrix along the
+specified dimension (by index). It assumes non-periodicity, and shifts
+the finite differencing stencil at the edges.
+"""
 function fdiff(var, dx, dim::Integer)
     d = similar(v)
 
@@ -193,11 +205,14 @@ function filter(fname_u, fname_v; np::Int=-1, nt::Int=-1, fname_part="particles.
     time_load, time_interp, time_advect, time_write
 end
 
-"Interpolate variable data onto particle paths.
+"""
+    interp_paths(particles, fname_data, var)
+
+Interpolate variable data onto particle paths.
 
 For a timeseries of particle positions (2 × np × nt), interpolate the
-variable with name var from the specified file."
-
+variable with name var from the specified file.
+"""
 function interp_paths(particles, fname_data, var)
     ds = Dataset(fname_data, "r")
     x = ds["X"][:]; y = ds["Y"][:]
@@ -228,6 +243,15 @@ function interp_paths(particles, fname_data, var)
     out_interp, time_load, time_interp
 end
 
+"""
+    filter_paths(paths, dt, min_freq, butterworth)
+
+High-pass filter Langrangian data along particle paths.
+
+For an array of data along particle paths (np × nt), with timestep
+dt, highpass filter each individual path with a given cutoff frequency
+and Butterworth filter coefficient.
+"""
 function filter_paths(paths, dt, min_freq, butterworth)
     nt = size(paths, 2)
 
@@ -245,6 +269,15 @@ function filter_paths(paths, dt, min_freq, butterworth)
     irfft(rfft(paths, 2) .* reshape(mask, 1, :), nt, 2)
 end
 
+"""
+    reinterp_grid(positions, data, points, nx, ny)
+
+Re-interpolate one timestep of Lagrangian data onto an Eulerian grid.
+
+For particles located at the given positions through time (2 × np),
+and data sampled at those particles, re-sample onto the grid specified
+by points.
+"""
 function reinterp_grid(positions, data, points, nx, ny)
     kdt = KDTree(positions)
     out = SharedArray{Float64}(nx, ny)
@@ -259,3 +292,5 @@ function reinterp_grid(positions, data, points, nx, ny)
 
     out
 end
+
+end # module
