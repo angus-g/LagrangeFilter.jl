@@ -1,5 +1,9 @@
 module LagrangeFilter
 
+include("advection.jl")
+
+using .Advection
+
 using FFTW, Interpolations, LinearAlgebra, NCDatasets, NearestNeighbors
 import Distributions.Uniform
 
@@ -47,11 +51,13 @@ function read_var_shmem(fname, var, t)
     ranges = [splits[i]*chunk_size + 1:splits[i+1]*chunk_size for i in 1:length(procs(s))]
 
     @sync @distributed for r in ranges
+        # open dataset per-process (can we cache this?)
         Dataset(fname, "r") do d
             s[:,r] = d[var][:,r,t,1]
         end
     end
 
+    # close metadata dataset
     close(d)
 
     s
@@ -89,7 +95,25 @@ function fdiff(var, dx, dim::Integer)
     d
 end
 
-function filter(fname_u, fname_v; np::Int=-1, nt::Int=-1, fname_part="particles.nc")
+"""
+    advect_particles(fname_u, fname_v; <keyword arguments>)
+
+Distribute and advect particles through velocity fields.
+
+To perform an Eulerian to Lagrangian transformation, particles are seeded in the
+velocity fields contained within the files specified by fname_u and fname_v. The
+particle location data is saved to a temporary NetCDF file for further processing.
+
+Particle seeding is uniform in space, and unaware of any topographic obstacles. RK4
+integration is used, and velocity data is interpolated linearly.
+
+# Arguments
+- `np`: the number of particles to seed (if negative, seed one particle for every 4×4 box)
+- `nt`: the number of timesteps for which to compute advection (if negative, compute all)
+- `fname_part::String`: the output filename for particle position data
+- `compress::Bool`: whether to compress the output file
+"""
+function advect_particles(fname_u, fname_v; np::Int=-1, nt::Int=-1, fname_part="particles.nc", compress=false)
     ds_u = Dataset(fname_u, "r")
     ds_v = Dataset(fname_v, "r")
 
@@ -99,15 +123,22 @@ function filter(fname_u, fname_v; np::Int=-1, nt::Int=-1, fname_part="particles.
         exit(1)
     end
 
-    # load coordinates and velocity variables without performing CF conversion
+    # load coordinates and velocity variables without performing CF
+    # conversion and make sure they're plain arrays
     x = nomissing(ds_u["X"][:]); y = nomissing(ds_u["Y"][:])
 
-    # get velocity timestep
+    # get velocity timestep - assume the timestep is uniform through time
     dt = ds_u["T"][2] - ds_u["T"][1]
 
+    # determine number of timesteps to compute
     if nt == -1
         nt = length(ds_u["T"])
     end
+
+    # original datasets aren't needed any more (we'll load data
+    # dynamically in read_var_shmem)
+    close(ds_u)
+    close(ds_v)
 
     ## generate random initial seeds
     if np == -1
@@ -131,10 +162,18 @@ function filter(fname_u, fname_v; np::Int=-1, nt::Int=-1, fname_part="particles.
     ds_out.dim["time"] = Inf
 
     # output variable (match layout of seeds)
-    part_arr = defVar(ds_out, "particles", Float64, ("d", "n", "time"))
+    deflatelevel = 0
+    shuffle = false
+    if compress
+        deflatelevel = 1
+        shuffle = true
+    end
+    part_arr = defVar(ds_out, "particles", Float64, ("d", "n", "time"),
+                      deflatelevel=deflatelevel, shuffle=shuffle)
 
     left = x[1]; width = x[end] - left
 
+    # functions to wrap velocity data for a timestep
     var_u(t) = read_var_shmem(fname_u, "U", t)
     var_v(t) = read_var_shmem(fname_v, "V", t)
 
@@ -145,6 +184,7 @@ function filter(fname_u, fname_v; np::Int=-1, nt::Int=-1, fname_part="particles.
     # convenience function to create an interpolator for a velocity field
     interpolator(u) = interpolate((x, y), u, Gridded(Linear()))
 
+    # timers for coarse-grain profiling
     time_load = 0.
     time_interp = 0.
     time_advect = 0.
@@ -160,38 +200,21 @@ function filter(fname_u, fname_v; np::Int=-1, nt::Int=-1, fname_part="particles.
             u_inter = (u + u_next) / 2; v_inter = (v + v_next) / 2
         end
 
-        # interpolators
+        # create interpolators onto all velocity fields
         time_interp += @elapsed begin
             vel_prev = (interpolator(u), interpolator(v))
             vel_inter = (interpolator(u_inter), interpolator(v_inter))
             vel_next = (interpolator(u_next), interpolator(v_next))
         end
 
-        velocity_at(vels, pos) = [vels[1](pos...)
-                                  vels[2](pos...)]
         # interpret a position as periodic in the x direction
-        period_x(pos) = [((pos[1] - left) + width) % width + left, pos[2]]
+        wrap(pos) = [((pos[1] - left) + width) % width + left, pos[2]]
 
         # update particle positions
         time_advect += @elapsed begin
             @sync @distributed for p = 1:num_seeds
-                pos = seeds[:,p]
-                
-                # evaluate at (t,x,y)
-                vel1 = velocity_at(vel_prev, pos)
-                pos1 = period_x(pos + 0.5 * vel1 * dt)
-
-                # evaluate at (t+.5,x',y')
-                vel2 = velocity_at(vel_inter, pos1)
-                pos2 = period_x(pos + 0.5 * vel2 * dt)
-
-                vel3 = velocity_at(vel_inter, pos2)
-                pos3 = period_x(pos + vel3 * dt)
-
-                vel4 = velocity_at(vel_next, pos3)
-
-                seeds[:,p] += (vel1 + 2*vel2 + 2*vel3 + vel4) / 6 * dt
-                seeds[:,p] = period_x(seeds[:,p])
+                seeds[:,p] = advect_rk4(dt, seeds[:,p], wrap,
+                                        vel_prev..., vel_inter..., vel_next...)
             end
         end
 
@@ -199,8 +222,6 @@ function filter(fname_u, fname_v; np::Int=-1, nt::Int=-1, fname_part="particles.
     end
 
     close(ds_out)
-    close(ds_u)
-    close(ds_v)
 
     time_load, time_interp, time_advect, time_write
 end
@@ -239,7 +260,6 @@ function interp_paths(particles, fname_data, var)
         end
     end
 
-    close(ds)
     out_interp, time_load, time_interp
 end
 
