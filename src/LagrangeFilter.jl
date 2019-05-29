@@ -117,6 +117,15 @@ function advect_particles(fname_u, fname_v; np::Int=-1, nt::Int=-1, fname_part="
     ds_u = Dataset(fname_u, "r")
     ds_v = Dataset(fname_v, "r")
 
+    times = Dict{String, Float64}()
+
+    # timers for coarse-grain profiling
+    times["load"] = 0.
+    times["interp"] = 0.
+    times["advect"] = 0.
+    times["write"] = 0.
+    times["seed"] = 0.
+
     ## check dimensions are compatible
     if ds_u["X"] != ds_v["X"] || ds_u["Y"] != ds_v["Y"] || ds_u["T"] != ds_v["T"]
         println("Error: velocity dataset dimensions don't match")
@@ -150,15 +159,18 @@ function advect_particles(fname_u, fname_v; np::Int=-1, nt::Int=-1, fname_part="
     x_dist = Uniform(x[1], x[end])
     y_dist = Uniform(y[1], y[end])
 
-    ## single array for seed positions, transpose so that x/y are adjacent
-    seeds = SharedArray{Float64}(2, num_seeds)
-    seeds[1,:] = rand(x_dist, num_seeds)
-    seeds[2,:] = rand(y_dist, num_seeds)
+    seed() = begin
+        particles = SharedArray{Float64}(2, num_seeds)
+        particles[1,:] = rand(x_dist, num_seeds)
+        particles[2,:] = rand(y_dist, num_seeds)
+        particles
+    end
 
     ## set up output file
     ds_out = Dataset(fname_part, "c")
     ds_out.dim["d"] = 2
-    ds_out.dim["n"] = num_seeds
+    # allocate enough space for all blocks at once
+    ds_out.dim["n"] = num_seeds * 16
     ds_out.dim["time"] = Inf
 
     # output variable (match layout of seeds)
@@ -172,6 +184,8 @@ function advect_particles(fname_u, fname_v; np::Int=-1, nt::Int=-1, fname_part="
                       deflatelevel=deflatelevel, shuffle=shuffle)
 
     left = x[1]; width = x[end] - left
+    # interpret a position as periodic in the x direction
+    wrap(pos) = [((pos[1] - left) + width) % width + left, pos[2]]
 
     # functions to wrap velocity data for a timestep
     var_u(t) = read_var_shmem(fname_u, "U", t)
@@ -184,42 +198,104 @@ function advect_particles(fname_u, fname_v; np::Int=-1, nt::Int=-1, fname_part="
     # convenience function to create an interpolator for a velocity field
     interpolator(u) = interpolate((x, y), u, Gridded(Linear()))
 
-    # timers for coarse-grain profiling
-    time_load = 0.
-    time_interp = 0.
-    time_advect = 0.
-    time_write = 0.
+    # when to seed new particles in (chop off the ends because we handle them manually)
+    seed_times = round.(Int, range(1, stop=nt, length=16))[2:end-1]
+
+    # generate initial seed positions (first block)
+    times["seed"] += @elapsed begin
+        particles = seed()
+    end
+
+    # save initial positions
+    times["write"] += @elapsed begin
+        part_arr[:,1:num_seeds,1] = particles
+    end
 
     ## advect particles (rk4)
-    @showprogress 1 "Particle advection..." for t = 1:nt
+    @showprogress 1 "Forward particle advection..." for t = 1:nt-1
         # update velocity
-        time_load += @elapsed begin
+        times["load"] += @elapsed begin
             u = u_next; v = v_next
-            u_next = var_u(t); v_next = var_v(t)
+            u_next = var_u(t+1); v_next = var_v(t+1)
         end
 
         # create interpolators onto all velocity fields
-        time_interp += @elapsed begin
+        times["interp"] += @elapsed begin
             vel_prev = (interpolator(u), interpolator(v))
             vel_next = (interpolator(u_next), interpolator(v_next))
         end
 
-        # interpret a position as periodic in the x direction
-        wrap(pos) = [((pos[1] - left) + width) % width + left, pos[2]]
-
         # update particle positions
-        time_advect += @elapsed begin
-            @sync @distributed for p = 1:num_seeds
-                seeds[:,p] = advect_rk4(dt, seeds[:,p], wrap, vel_prev..., vel_next...)
+        times["advect"] += @elapsed begin
+            @sync @distributed for p = 1:size(particles, 2)
+                particles[:,p] = advect_rk4(dt, particles[:,p], wrap, vel_prev..., vel_next...)
             end
         end
 
-        time_write += @elapsed part_arr[:,:,t] = seeds
+        times["seed"] += @elapsed begin
+            if t+1 in seed_times
+                # seed in a new particle block
+                # this way, their initial positions are saved
+                particles = hcat(particles, seed())
+            end
+        end
+
+        times["write"] += @elapsed begin
+            part_arr[:,1:size(particles,2),t+1] = particles
+        end
+    end
+
+    # generate initial seed positions for backward advection (at final timestep)
+    times["seed"] += @elapsed begin
+        particles = seed()
+    end
+
+    # again, save these positions
+    times["write"] += @elapsed begin
+        part_arr[:,end-num_seeds+1:end,nt] = particles
+    end
+
+    # negate final velocity field
+    u_next = -u_next; v_next = -v_next
+
+    ## advect particles backwards
+    # we don't need to seed them in, but we need to keep track of when
+    # particles were seeded so we can start advecting them at the right place
+    @showprogress 1 "Backward particle advection..." for t = nt:-1:2
+        times["seed"] += @elapsed begin
+            if t in seed_times
+                # load in the next block
+                particles = hcat(part_arr[:,end-size(particles,2)-num_seeds+1:end-size(particles,2),t], particles)
+            end
+        end
+
+        # update velocity
+        times["load"] += @elapsed begin
+            u = u_next; v = v_next
+            u_next = -var_u(t-1); v_next = -var_v(t-1)
+        end
+
+        # create interpolators
+        times["interp"] += @elapsed begin
+            vel_prev = (interpolator(u), interpolator(v))
+            vel_next = (interpolator(u_next), interpolator(v_next))
+        end
+
+        # update particle positions
+        times["advect"] += @elapsed begin
+            @sync @distributed for p = 1:size(particles, 2)
+                particles[:,p] = advect_rk4(dt, particles[:,p], wrap, vel_prev..., vel_next...)
+            end
+        end
+
+        times["write"] += @elapsed begin
+            part_arr[:,end-size(particles,2)+1:end,t-1] = particles
+        end
     end
 
     close(ds_out)
 
-    time_load, time_interp, time_advect, time_write
+    times
 end
 
 """
