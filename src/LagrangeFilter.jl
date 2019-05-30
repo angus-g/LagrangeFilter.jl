@@ -185,7 +185,7 @@ function advect_particles(fname_u, fname_v; np::Int=-1, nt::Int=-1, fname_part="
 
     left = x[1]; width = x[end] - left
     # interpret a position as periodic in the x direction
-    wrap(pos) = [((pos[1] - left) + width) % width + left, pos[2]]
+    wrap(pos) = hcat(((pos[:,1] .- left) .+ width) .% width .+ left, pos[:,2])
 
     # functions to wrap velocity data for a timestep
     var_u(t) = read_var_shmem(fname_u, "U", t)
@@ -225,10 +225,14 @@ function advect_particles(fname_u, fname_v; np::Int=-1, nt::Int=-1, fname_part="
             vel_next = (interpolator(u_next), interpolator(v_next))
         end
 
+        # calculate workers' indices over particles
+        splits = [round(Int, x) for x in range(0, stop=size(particles, 2), length=nprocs()+1)]
+        ranges = [splits[i]+1:splits[i+1] for i in 1:nprocs()]
+
         # update particle positions
         times["advect"] += @elapsed begin
-            @sync @distributed for p = 1:size(particles, 2)
-                particles[:,p] = advect_rk4(dt, particles[:,p], wrap, vel_prev..., vel_next...)
+            @sync @distributed for r in ranges
+                particles[:,r] = advect_rk4(dt, particles[:,r], wrap, vel_prev..., vel_next...)
             end
         end
 
@@ -281,10 +285,14 @@ function advect_particles(fname_u, fname_v; np::Int=-1, nt::Int=-1, fname_part="
             vel_next = (interpolator(u_next), interpolator(v_next))
         end
 
+        # calculate workers' indices over particles
+        splits = [round(Int, x) for x in range(0, stop=size(particles, 2), length=nprocs()+1)]
+        ranges = [splits[i]+1:splits[i+1] for i in 1:nprocs()]
+
         # update particle positions
         times["advect"] += @elapsed begin
-            @sync @distributed for p = 1:size(particles, 2)
-                particles[:,p] = advect_rk4(dt, particles[:,p], wrap, vel_prev..., vel_next...)
+            @sync @distributed for r in ranges
+                particles[:,r] = advect_rk4(dt, particles[:,r], wrap, vel_prev..., vel_next...)
             end
         end
 
