@@ -8,3 +8,11 @@ Transform data to Lagrangian frame of reference (and back) for filtering, effici
 4. Convert each particle path to frequency domain and filter
 5. Invert Fourier transform back to temporal domain
 6. Interpolate back onto the original grid
+
+## Installation
+To install as a development package
+
+```
+julia> import Pkg
+julia> Pkg.develop("https://github.com/angus-g/LagrangeFilter.jl.git")
+```
